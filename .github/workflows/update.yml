@@ -1,0 +1,39 @@
+name: Update FIRMS fire data
+
+on:
+  schedule:
+    - cron: "17 * * * *"
+
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  update-data:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Repository auschecken
+        uses: actions/checkout@v4
+
+      - name: Python einrichten
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Python-Pakete installieren
+        run: pip install -r requirements.txt
+
+      - name: FIRMS-Daten herunterladen
+        env:
+          FIRMS_MAP_KEY: ${{ secrets.FIRMS_MAP_KEY }}
+        run: python update_fires.py
+
+      - name: CSV speichern
+        run: |
+          git config user.name "FIRMS Data Bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add data/fires.csv
+          git diff --cached --quiet || git commit -m "Update FIRMS fire data"
+          git push

@@ -4,26 +4,98 @@ from pathlib import Path
 
 import pandas as pd
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 
 MAP_KEY = os.environ["FIRMS_MAP_KEY"]
 
-SOURCE = "VIIRS_NOAA20_NRT"
-AREA = "world"
-DAY_RANGE = 1
+SOURCES = [
+    "VIIRS_SNPP_NRT",
+    "VIIRS_NOAA20_NRT",
+    "VIIRS_NOAA21_NRT",
+    "MODIS_NRT",
+]
 
-url = (
-    "https://firms.modaps.eosdis.nasa.gov/api/area/csv/"
-    f"{MAP_KEY}/{SOURCE}/{AREA}/{DAY_RANGE}"
+retry_strategy = Retry(
+    total=6,
+    connect=6,
+    read=6,
+    status=6,
+    backoff_factor=10,
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=["GET"],
 )
 
-response = requests.get(url, timeout=180)
-response.raise_for_status()
+session = requests.Session()
+session.mount(
+    "https://",
+    HTTPAdapter(max_retries=retry_strategy),
+)
 
-fires = pd.read_csv(StringIO(response.text))
+frames = []
 
-# Uhrzeit immer vierstellig formatieren:
-# 35 wird beispielsweise zu 0035.
+for source in SOURCES:
+    url = (
+        "https://firms.modaps.eosdis.nasa.gov/api/area/csv/"
+        f"{MAP_KEY}/{source}/world/1"
+    )
+
+    print(f"Lade {source} ...")
+
+    try:
+        response = session.get(
+            url,
+            timeout=(30, 180),
+            headers={
+                "User-Agent": "firms-flourish-map/1.0"
+            },
+        )
+        response.raise_for_status()
+
+    except requests.RequestException as error:
+        print(f"{source}: Download fehlgeschlagen: {error}")
+        continue
+
+    if not response.text.strip():
+        print(f"{source}: Leere Antwort, wird übersprungen.")
+        continue
+
+    try:
+        frame = pd.read_csv(StringIO(response.text))
+    except Exception as error:
+        print(f"{source}: CSV konnte nicht gelesen werden: {error}")
+        print(response.text[:500])
+        continue
+
+    required_columns = {
+        "latitude",
+        "longitude",
+        "acq_date",
+        "acq_time",
+    }
+
+    if not required_columns.issubset(frame.columns):
+        print(f"{source}: Unerwartete Antwort.")
+        print(response.text[:500])
+        continue
+
+    frame["source"] = source
+    frames.append(frame)
+
+    print(f"{source}: {len(frame)} Zeilen geladen.")
+
+if not frames:
+    raise RuntimeError(
+        "Keine FIRMS-Quelle war erreichbar. "
+        "Die bestehende CSV bleibt unverändert."
+    )
+
+fires = pd.concat(
+    frames,
+    ignore_index=True,
+)
+
 fires["acq_time"] = (
     fires["acq_time"]
     .astype(str)
@@ -31,63 +103,72 @@ fires["acq_time"] = (
     .str.zfill(4)
 )
 
-# Datum und Uhrzeit zu einem gemeinsamen UTC-Zeitpunkt verbinden.
 fires["acq_datetime"] = pd.to_datetime(
-    fires["acq_date"].astype(str) + " " + fires["acq_time"],
+    fires["acq_date"].astype(str)
+    + " "
+    + fires["acq_time"],
     format="%Y-%m-%d %H%M",
     errors="coerce",
     utc=True,
 )
 
-# Nur normale und hochwahrscheinliche Detektionen verwenden.
-fires["confidence"] = fires["confidence"].astype(str).str.lower()
+fires["frp"] = pd.to_numeric(
+    fires.get("frp"),
+    errors="coerce",
+)
+
+fires["weight"] = 1
 
 fires = fires[
-    fires["confidence"].isin(["n", "h"])
-    & fires["acq_datetime"].notna()
+    fires["acq_datetime"].notna()
 ]
 
-# Kleine beziehungsweise schwache Messungen ausblenden.
-fires["frp"] = pd.to_numeric(fires["frp"], errors="coerce")
-fires = fires[fires["frp"].fillna(0) >= 5]
+columns = [
+    "latitude",
+    "longitude",
+    "acq_datetime",
+    "frp",
+    "satellite",
+    "confidence",
+    "daynight",
+    "source",
+    "weight",
+]
 
-# Verständliche Bezeichnungen für Flourish erzeugen.
-fires["confidence_label"] = fires["confidence"].map(
-    {
-        "n": "Normal",
-        "h": "Hoch",
-    }
+existing_columns = [
+    column
+    for column in columns
+    if column in fires.columns
+]
+
+fires = fires[existing_columns]
+
+fires["latitude"] = pd.to_numeric(
+    fires["latitude"],
+    errors="coerce",
+).round(4)
+
+fires["longitude"] = pd.to_numeric(
+    fires["longitude"],
+    errors="coerce",
+).round(4)
+
+fires = fires.dropna(
+    subset=["latitude", "longitude"]
 )
 
-fires["daynight_label"] = fires["daynight"].map(
-    {
-        "D": "Tag",
-        "N": "Nacht",
-    }
-)
-
-fires["source"] = SOURCE
-
-# Nur die für die Visualisierung benötigten Spalten behalten.
-fires = fires[
-    [
+fires = fires.drop_duplicates(
+    subset=[
         "latitude",
         "longitude",
         "acq_datetime",
-        "frp",
-        "confidence_label",
-        "satellite",
-        "daynight_label",
         "source",
     ]
-]
+)
 
-# Koordinaten vereinheitlichen und offensichtliche Dubletten entfernen.
-fires["latitude"] = fires["latitude"].round(4)
-fires["longitude"] = fires["longitude"].round(4)
-
-fires = fires.drop_duplicates(
-    subset=["latitude", "longitude", "acq_datetime"]
+fires["acq_datetime"] = (
+    fires["acq_datetime"]
+    .dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 )
 
 fires = fires.sort_values(
@@ -95,17 +176,20 @@ fires = fires.sort_values(
     ascending=False,
 )
 
-# ISO-Zeitformat für Flourish.
-fires["acq_datetime"] = fires["acq_datetime"].dt.strftime(
-    "%Y-%m-%dT%H:%M:%SZ"
-)
-
 output_directory = Path("data")
 output_directory.mkdir(exist_ok=True)
 
+temporary_file = output_directory / "fires.tmp.csv"
+output_file = output_directory / "fires.csv"
+
 fires.to_csv(
-    output_directory / "fires.csv",
+    temporary_file,
     index=False,
 )
 
-print(f"{len(fires)} Detektionen gespeichert.")
+temporary_file.replace(output_file)
+
+print(
+    f"{len(fires)} Detektionen aus "
+    f"{len(frames)} Quellen gespeichert."
+)

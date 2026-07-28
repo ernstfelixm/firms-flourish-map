@@ -28,7 +28,21 @@ jobs:
       - name: FIRMS-Daten herunterladen
         env:
           FIRMS_MAP_KEY: ${{ secrets.FIRMS_MAP_KEY }}
-        run: python update_fires.py
+        run: |
+          for attempt in 1 2 3; do
+            echo "Versuch $attempt von 3"
+
+            if python update_fires.py; then
+              exit 0
+            fi
+
+            if [ "$attempt" -lt 3 ]; then
+              echo "Warte 5 Minuten vor dem nächsten Versuch ..."
+              sleep 300
+            fi
+          done
+
+          exit 1
 
       - name: CSV speichern
         run: |
